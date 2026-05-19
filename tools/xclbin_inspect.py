@@ -89,13 +89,6 @@ def cmd_inspect(args):
                 print("── CDO / AIE Hardware Configuration ──────────────────")
                 print(parser.topology_summary())
                 print()
-                print(f"  Total CDO commands parsed: {len(parser.cmds)}")
-                # Breakdown by type
-                from collections import Counter
-                counts = Counter(type(c).__name__ for c in parser.cmds)
-                for name, cnt in sorted(counts.items()):
-                    print(f"    {name:<22} {cnt:>6}")
-                print()
 
             if show_all or args.tile_programs:
                 progs = parser.extract_tile_programs()
