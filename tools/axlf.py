@@ -88,16 +88,14 @@ SECTION_KINDS: dict[int, str] = {
 
 AXLF_MAGIC = b"xclbin2\x00"
 
-# Empirically verified section entry layout from hex dump of NPU2 xclbins:
-#   [+0x00]  uint32  sectionKind
-#   [+0x04]  char[16] sectionName
-#   [+0x14]  uint64  sectionOffset  (from start of file)
-#   [+0x1C]  uint64  sectionSize    (bytes)
-# Total: 36 bytes per entry.
-#
-# (The canonical XRT xclbin.h has flags between kind and name, but NPU2
-# binaries use this compact layout with no flags word.)
-AXLF_SECTION_ENTRY_SIZE = 36
+# Official layout from XRT xclbin.h  (40-byte struct with alignment padding):
+#   [+0x00]  uint32   m_sectionKind
+#   [+0x04]  char[16] m_sectionName
+#   [+0x14]  uint8[4] (implicit compiler padding for uint64 alignment)
+#   [+0x18]  uint64   m_sectionOffset  (from start of file)
+#   [+0x20]  uint64   m_sectionSize    (bytes)
+# Total: 40 bytes per entry.
+AXLF_SECTION_ENTRY_SIZE = 40
 
 AXLF_NSECTIONS_OFFSET     = 0x1C0   # offset of uint32 section count
 AXLF_SECTION_TABLE_OFFSET = 0x1C8   # section entries start here
@@ -265,10 +263,11 @@ def load(path: str | Path) -> Axlf:
         entry_off = table_base + i * AXLF_SECTION_ENTRY_SIZE
         if entry_off + AXLF_SECTION_ENTRY_SIZE > len(data):
             break
-        kind      = struct.unpack_from("<I", data, entry_off)[0]
-        name_raw  = data[entry_off + 4: entry_off + 20]          # 16-byte name
-        sec_offset = struct.unpack_from("<Q", data, entry_off + 20)[0]
-        sec_size   = struct.unpack_from("<Q", data, entry_off + 28)[0]
+        kind       = struct.unpack_from("<I", data, entry_off)[0]
+        name_raw   = data[entry_off + 4: entry_off + 20]          # 16-byte name
+        # +20 = 4 bytes implicit alignment padding (skipped)
+        sec_offset = struct.unpack_from("<Q", data, entry_off + 24)[0]
+        sec_size   = struct.unpack_from("<Q", data, entry_off + 32)[0]
         name = name_raw.split(b"\x00")[0].decode("ascii", errors="replace")
 
         sec_data = data[sec_offset: sec_offset + sec_size] if sec_size else b""
