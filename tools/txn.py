@@ -48,6 +48,8 @@ class Op(IntEnum):
 
 
 OP_NAMES = {int(o): o.name for o in Op}
+# Empirically identified opcodes not in the XAIE2 standard set:
+OP_NAMES[0x30] = "DMA_BD_FENCE"   # 1-word DMA transaction fence; precedes each BD setup group
 
 
 # ── Address helpers ───────────────────────────────────────────────────────────
@@ -244,19 +246,28 @@ class TxnParser:
                 w = self._read(1)
                 self.instrs.append(Instr(byte_off, opcode, w))
             else:
-                # Unknown: read the op_size field if available to skip correctly
-                # Try to advance by reading op_size from word[1] bits[7:2]
-                if self.pos + 1 < len(self.words):
+                # Unknown opcodes — use bits[31:24] of op word as instruction
+                # size (in words) when available; fall back to skip-1.
+                maybe_size = (self.words[self.pos] >> 24) & 0xFF
+                if 1 < maybe_size <= 64:
+                    n = maybe_size
+                elif self.pos + 1 < len(self.words):
                     raw_size = (self.words[self.pos + 1] >> 2) & 0x3FFFFF
-                    n = raw_size if 1 < raw_size < 256 else 1
+                    n = raw_size if 1 < raw_size <= 64 else 1
                 else:
                     n = 1
+                n = min(n, len(self.words) - self.pos)
                 w = self._read(n)
                 self.instrs.append(Instr(byte_off, opcode, w))
         return self.instrs
 
     def _parse_write(self, byte_off: int):
         # 6 words: [opcode][unused][addr_word][unused][value][op_size<<2]
+        # Guard: if < 6 words remain, read what we can and emit unknown
+        if self.pos + 6 > len(self.words):
+            w = self._read(len(self.words) - self.pos)
+            self.instrs.append(Instr(byte_off, Op.WRITE, w))
+            return
         w = self._read(6)
         col, row, reg = decode_addr(w[2])
         value = w[4]
@@ -276,10 +287,14 @@ class TxnParser:
 
     def _parse_blockwrite(self, byte_off: int):
         # word[0]=opcode, word[1]=addr, word[2]=count, word[3..N]=data
+        # Some formats encode count in header[0] bits[31:16] instead of header[2]
         header = self._read(3)
         opcode = header[0] & 0xFF
         col, row, reg = decode_addr(header[1])
+        # Use header[2] as count; sanity-check against remaining words
         count = header[2]
+        if count > len(self.words) - self.pos:
+            count = len(self.words) - self.pos
         payload = self._read(count)
         all_words = header + payload
         self.instrs.append(BlockWriteInstr(
@@ -435,3 +450,103 @@ def extract_dma_topology(instrs: list[Instr]) -> list[DmaTransfer]:
             strides=strides,
         ))
     return transfers
+
+
+# ── DMA BD group extractor ────────────────────────────────────────────────────
+#
+# In the aiebu DPU ctrltext, each shim DMA BD is programmed by a "BD group":
+#   DMA_BD_FENCE (1 word, opcode 0x30) followed by exactly 6 WRITEs (36 words)
+#
+# The 6 WRITEs are:
+#   [0] DDR addr_low placeholder  — RELA type-5 patches w[0] with actual DDR addr
+#       reg=0x0 (decoded from w[2]=0), w[4]=BD_ctrl_word
+#   [1] DMA size/config           — reg=0x81 (or col-encoded), val=0
+#   [2] BD.word1 (addr_high)      — reg=BD_base+4|col_bits, val=addr_hi (DDR bits[39:32])
+#   [3] Queue kickoff (indirect)  — reg=0x3, val=queue_register_address
+#   [4] Status clear              — reg=0x1c, val=0
+#   [5] DMA enable/control        — reg=0x18, val=0
+#
+# The BD and column are identified from WRITE[2]'s register address.
+# RELA r_offset points to the START of WRITE[0] (i.e., its w[0] = DDR addr_low slot).
+
+# Shim DMA channel queue registers (tile-local offsets, col bits added at runtime)
+_SHIM_QUEUE_REGS: dict[int, tuple[str, int]] = {
+    0x1d200: ("S2MM", 0), 0x1d204: ("S2MM", 0),
+    0x1d208: ("S2MM", 1), 0x1d20c: ("S2MM", 1),
+    0x1d210: ("MM2S", 0), 0x1d214: ("MM2S", 0),
+    0x1d218: ("MM2S", 1), 0x1d21c: ("MM2S", 1),
+}
+
+
+@dataclass
+class DmaBdGroup:
+    """One DMA BD programming group decoded from a DMA_BD_FENCE + 6 WRITEs sequence."""
+    fence_instr_idx: int    # index of the DMA_BD_FENCE instruction
+    addr_write_idx: int     # index of WRITE[0] (the one whose w[0] is RELA-patched)
+    ddr_addr_lo_placeholder: int  # w[0] before RELA patching (e.g. 0x00010000)
+    bd_ctrl: int            # BD control word from WRITE[0].w[4]
+    col: int                # shim column (from WRITE[2]'s register address bits[31:25])
+    bd_id: int              # BD index within the column's shim DMA (0..15)
+    addr_hi: int            # DDR addr bits[39:32] (from WRITE[2].value)
+    direction: str          # "MM2S" or "S2MM" or "?"
+    channel: int            # DMA channel index (0 or 1), -1 if unknown
+
+    def describe(self) -> str:
+        dir_arrow = "→NPU" if self.direction == "MM2S" else "←NPU"
+        return (f"DMA_BD_GROUP  col={self.col}  bd={self.bd_id}  "
+                f"{self.direction}_ch{self.channel}  {dir_arrow}  "
+                f"ddr_hi={self.addr_hi}  ctrl=0x{self.bd_ctrl:08x}")
+
+
+def find_dma_bd_groups(instrs: list[Instr]) -> list[DmaBdGroup]:
+    """Scan the instruction stream for DMA_BD_FENCE + 6 WRITEs patterns.
+
+    Each such group programs one shim DMA BD with a DDR buffer address.
+    The first WRITE's w[0] is the RELA relocation target (DDR addr_low placeholder).
+    Returns one DmaBdGroup per fence found.
+    """
+    groups: list[DmaBdGroup] = []
+    for fi, instr in enumerate(instrs):
+        if instr.opcode != 0x30:
+            continue
+        # Need at least 6 more instructions
+        if fi + 6 >= len(instrs):
+            continue
+        # WRITE[0]: DDR addr_lo write — reg must be 0, w[0] is RELA target
+        addr_w = instrs[fi + 1]
+        if not isinstance(addr_w, WriteInstr) or addr_w.reg != 0:
+            continue
+        placeholder = addr_w.words[0] if addr_w.words else 0
+        bd_ctrl = addr_w.words[4] if len(addr_w.words) > 4 else 0
+
+        # WRITE[2]: BD.word1 → col and bd_id
+        bd_word1_w = instrs[fi + 3]
+        col, bd_id, addr_hi = -1, -1, -1
+        if isinstance(bd_word1_w, WriteInstr):
+            r = bd_word1_w.reg
+            if 0x1d004 <= r <= 0x1d1fc and (r - 0x1d004) % 0x20 == 0:
+                col = bd_word1_w.col
+                bd_id = (r - 0x1d004) // 0x20
+                addr_hi = bd_word1_w.value
+
+        # WRITE[3]: queue kickoff → direction and channel (value encodes queue reg)
+        queue_w = instrs[fi + 4]
+        direction, channel = "?", -1
+        if isinstance(queue_w, WriteInstr):
+            qv = queue_w.value & 0x1FFFFF  # strip column bits
+            if qv in _SHIM_QUEUE_REGS:
+                direction, channel = _SHIM_QUEUE_REGS[qv]
+
+        groups.append(DmaBdGroup(
+            fence_instr_idx=fi,
+            addr_write_idx=fi + 1,
+            ddr_addr_lo_placeholder=placeholder,
+            bd_ctrl=bd_ctrl,
+            col=col,
+            bd_id=bd_id,
+            addr_hi=addr_hi,
+            direction=direction,
+            channel=channel,
+        ))
+    return groups
+
