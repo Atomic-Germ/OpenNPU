@@ -1,3 +1,6 @@
 [submodule "mlir-aie"]
 	path = mlir-aie
 	url = https://github.com/Xilinx/mlir-aie.git
+[submodule "llvm-project"]
+	path = llvm-project
+	url = https://github.com/llvm/llvm-project.git
